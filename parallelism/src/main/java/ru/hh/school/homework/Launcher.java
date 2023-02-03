@@ -53,7 +53,8 @@ public class Launcher {
     ExecutorService executor = Executors.newFixedThreadPool(numOfTHreads);
     Path path = Paths.get("").toAbsolutePath();
 
-    launch(path, Launcher::naiveSearch, executor);
+//    launch(path, Launcher::naiveSearch, executor);
+    launch(path, Launcher::mockSearch, executor);
 
     executor.shutdown();
   }
@@ -85,6 +86,9 @@ public class Launcher {
 //            Было сомнение, следует ли делать чтение с диска асинхронным.
 //            Всё-таки это едичный ресурс, который слабо умеет параллелится.
             .map((file) -> CompletableFuture.supplyAsync(() -> naiveCount(file), executor))
+            // Переход к Eager evaluation, чтобы сформировать список задач и запустить их разом
+            .toList()
+            .stream()
             .map(CompletableFuture::join)
             .flatMap(map -> map.entrySet().stream())
             .filter(Objects::nonNull)
@@ -110,6 +114,9 @@ public class Launcher {
     var queries = info.getValue();
     var output = queries.stream()
             .map(q -> CompletableFuture.supplyAsync(() -> Map.entry(q, search.apply(q)), executor))
+            // Переход к Eager evaluation, чтобы сформировать список задач и запустить их разом
+            .toList()
+            .stream()
             .map(CompletableFuture::join)
             .map(res -> formatOutput(path, res))
             .collect(Collectors.joining("\n"));
