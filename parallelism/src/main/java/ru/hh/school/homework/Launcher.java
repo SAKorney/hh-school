@@ -27,6 +27,8 @@ import static java.util.stream.Collectors.groupingBy;
 import static java.util.stream.Collectors.toMap;
 
 public class Launcher {
+  private static final int ONLY_DIR_WITHOUT_SUB = 1;
+  private static final int TOP = 10;
   public static void main(String[] args) throws IOException, InterruptedException {
     // Написать код, который, как можно более параллельно:
     // - по заданному пути найдет все "*.java" файлы
@@ -51,34 +53,38 @@ public class Launcher {
     ExecutorService executor = Executors.newFixedThreadPool(numOfTHreads);
     Path path = Paths.get("").toAbsolutePath();
 
-    try (Stream<Path> paths = Files.walk(path)) {
-      paths
-        .parallel()
-        .filter(Files::isDirectory)
-        .map(p -> processDirectory(p, executor))
-        .filter(info -> !info.getValue().isEmpty())
-        .forEach(q -> processQueries(q, Launcher::mockSearch, executor));
-    }
+    launch(path, Launcher::naiveSearch, executor);
 
     executor.shutdown();
   }
 
+  private static void launch(Path path,  Function<String, Long> search, ExecutorService executor) throws IOException {
+    try (Stream<Path> paths = Files.walk(path)) {
+      paths
+              .parallel()
+              .filter(Files::isDirectory)
+              .map(p -> processDirectory(p, executor))
+              .filter(info -> !info.getValue().isEmpty())
+              .forEach(q -> processQueries(q, search, executor));
+    }
+  }
+
   private static Map.Entry<Path, List<String>> processDirectory(Path path, ExecutorService executor) {
     try {
-      return Map.entry(path, calcStat(path));
+      return Map.entry(path, calcStat(path, executor));
     }
     catch (IOException ignored) {
       return Map.entry(path, List.of());
     }
   }
 
-  private static List<String> calcStat(Path path) throws IOException {
-    return Files.walk(path, 1)
+  private static List<String> calcStat(Path path,  ExecutorService executor) throws IOException {
+    return Files.walk(path, ONLY_DIR_WITHOUT_SUB)
             .filter(Launcher::isJavaFile)
 //            .map(Launcher::naiveCount)
 //            Было сомнение, следует ли делать чтение с диска асинхронным.
 //            Всё-таки это едичный ресурс, который слабо умеет параллелится.
-            .map((file) -> CompletableFuture.supplyAsync(() -> naiveCount(file)))
+            .map((file) -> CompletableFuture.supplyAsync(() -> naiveCount(file), executor))
             .map(CompletableFuture::join)
             .flatMap(map -> map.entrySet().stream())
             .filter(Objects::nonNull)
@@ -90,7 +96,7 @@ public class Launcher {
             .entrySet()
             .stream()
             .sorted(comparingByValue(reverseOrder()))
-            .limit(10)
+            .limit(TOP)
             .map(Map.Entry::getKey)
             .collect(Collectors.toList());
   }
@@ -107,6 +113,10 @@ public class Launcher {
             .map(CompletableFuture::join)
             .map(res -> formatOutput(path, res))
             .collect(Collectors.joining("\n"));
+    // Вывод ускорится, если сразу выводить на консоль.
+    // Однако, вывод будет без группировки по директориям
+    // т.к. будет осуществляться для тех слов, которые были
+    // обработаны раньше других.
     System.out.println(output);
   }
 
@@ -128,7 +138,7 @@ public class Launcher {
         .entrySet()
         .stream()
         .sorted(comparingByValue(reverseOrder()))
-        .limit(10)
+        .limit(TOP)
         .collect(toMap(Map.Entry::getKey, Map.Entry::getValue));
     }
     catch (IOException e) {
@@ -140,16 +150,21 @@ public class Launcher {
     System.out.println(naiveSearch("public"));
   }
 
-  private static long naiveSearch(String query) throws IOException {
-    Document document = Jsoup //
-      .connect("https://www.google.com/search?q=" + query) //
-      .userAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/80.0.3987.116 Safari/537.36") //
-      .get();
+  private static long naiveSearch(String query) {
+    try {
+      Document document = Jsoup //
+              .connect("https://www.google.com/search?q=" + query) //
+              .userAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/80.0.3987.116 Safari/537.36") //
+              .get();
 
-    Element divResultStats = document.select("div#slim_appbar").first();
-    String text = divResultStats.text();
-    String resultsPart = text.substring(0, text.indexOf('('));
-    return Long.parseLong(resultsPart.replaceAll("[^0-9]", ""));
+      Element divResultStats = document.select("div#slim_appbar").first();
+      String text = divResultStats.text();
+      String resultsPart = text.substring(0, text.indexOf('('));
+      return Long.parseLong(resultsPart.replaceAll("[^0-9]", ""));
+    }
+    catch (IOException e) {
+      throw new RuntimeException(e);
+    }
   }
 
   private static final Random rnd = new Random();
