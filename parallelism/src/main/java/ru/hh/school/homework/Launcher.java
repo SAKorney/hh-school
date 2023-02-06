@@ -7,7 +7,7 @@ import java.nio.file.Paths;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
-import java.util.Random;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.CompletableFuture;
@@ -49,33 +49,53 @@ public class Launcher {
     // Порядок результатов в консоли не обязательный.
     // При желании naiveSearch и naiveCount можно оптимизировать.
 
-    int numOfTHreads = Runtime.getRuntime().availableProcessors();
-    ExecutorService executor = Executors.newFixedThreadPool(numOfTHreads);
+    int numOfThreads = Runtime.getRuntime().availableProcessors();
+    // Два отдельных пула для чтения с диска и для запросов в сеть
+    ExecutorService executorFileIO = Executors.newFixedThreadPool(numOfThreads/2);
+    ExecutorService executorNetworkIO = Executors.newFixedThreadPool(numOfThreads/2);
+
     Path path = Paths.get("").toAbsolutePath();
 
-//    launch(path, Launcher::naiveSearch, executor);
-    launch(path, Launcher::mockSearch, executor);
+    // Декорирование метода поиска кэшированием
+    var search = new CachedFunction<>(MockSearchEngine::mockSearch);
+    launch(path, search, executorFileIO, executorNetworkIO);
 
-    executor.shutdown();
+    executorFileIO.shutdown();
+    executorNetworkIO.shutdown();
   }
 
-  private static void launch(Path path,  Function<String, Long> search, ExecutorService executor) throws IOException {
+  private static void launch(Path path,
+                             Function<String, Long> search,
+                             ExecutorService executorFileIO,
+                             ExecutorService executorNetworkIO) throws IOException {
     try (Stream<Path> paths = Files.walk(path)) {
       paths
               .parallel()
               .filter(Files::isDirectory)
-              .map(p -> processDirectory(p, executor))
-              .filter(info -> !info.getValue().isEmpty())
-              .forEach(q -> processQueries(q, search, executor));
+              .forEach(p -> process(p, search, executorFileIO, executorNetworkIO));
     }
   }
 
-  private static Map.Entry<Path, List<String>> processDirectory(Path path, ExecutorService executor) {
+  private static void process(Path path,
+                              Function<String, Long> search,
+                              ExecutorService executorFileIO,
+                              ExecutorService executorNetworkIO) {
     try {
-      return Map.entry(path, calcStat(path, executor));
+      CompletableFuture
+              .supplyAsync(() -> processDirectory(path, executorFileIO))
+              .thenAccept(dir -> processQueries(dir, search, executorNetworkIO))
+              .get();
+    } catch ( InterruptedException | ExecutionException e) {
+      throw new RuntimeException(e);
     }
-    catch (IOException ignored) {
-      return Map.entry(path, List.of());
+  }
+
+  private static DirectoryInfo processDirectory(Path path, ExecutorService executor) {
+    try {
+      return new DirectoryInfo(path, calcStat(path, executor));
+    }
+    catch (IOException e) {
+      throw new RuntimeException(e);
     }
   }
 
@@ -109,9 +129,10 @@ public class Launcher {
     return Files.isRegularFile(path) && path.getFileName().toString().endsWith("java");
   }
 
-  private static void processQueries(Map.Entry<Path, List<String>> info, Function<String, Long> search, ExecutorService executor) {
-    var path = info.getKey();
-    var queries = info.getValue();
+  private static void processQueries(DirectoryInfo info, Function<String, Long> search, ExecutorService executor) {
+    if (info.isEmpty()) return;
+    var path = info.path();
+    var queries = info.fileNames();
     var output = queries.stream()
             .map(q -> CompletableFuture.supplyAsync(() -> Map.entry(q, search.apply(q)), executor))
             // Переход к Eager evaluation, чтобы сформировать список задач и запустить их разом
@@ -150,38 +171,6 @@ public class Launcher {
     }
     catch (IOException e) {
       throw new RuntimeException(e);
-    }
-  }
-
-  private static void testSearch() throws IOException {
-    System.out.println(naiveSearch("public"));
-  }
-
-  private static long naiveSearch(String query) {
-    try {
-      Document document = Jsoup //
-              .connect("https://www.google.com/search?q=" + query) //
-              .userAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/80.0.3987.116 Safari/537.36") //
-              .get();
-
-      Element divResultStats = document.select("div#slim_appbar").first();
-      String text = divResultStats.text();
-      String resultsPart = text.substring(0, text.indexOf('('));
-      return Long.parseLong(resultsPart.replaceAll("[^0-9]", ""));
-    }
-    catch (IOException e) {
-      throw new RuntimeException(e);
-    }
-  }
-
-  private static final Random rnd = new Random();
-  private static long mockSearch(String query) {
-    try {
-      Thread.sleep(1000);
-      return rnd.nextLong(500_000);
-    }
-    catch (InterruptedException ignored) {
-      return 0;
     }
   }
 }
