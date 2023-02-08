@@ -3,11 +3,22 @@ package ru.hh.school.homework;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.util.List;
 import java.util.Map;
+import java.util.Objects;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.CompletableFuture;
+import java.util.function.Function;
+import java.util.stream.Collectors;
 import java.util.stream.Stream;
+
 import org.jsoup.Jsoup;
 import org.jsoup.nodes.Document;
 import org.jsoup.nodes.Element;
+
 import static java.util.Collections.reverseOrder;
 import static java.util.Map.Entry.comparingByValue;
 import static java.util.function.Function.identity;
@@ -16,8 +27,9 @@ import static java.util.stream.Collectors.groupingBy;
 import static java.util.stream.Collectors.toMap;
 
 public class Launcher {
-
-  public static void main(String[] args) throws IOException {
+  private static final int ONLY_DIR_WITHOUT_SUB = 1;
+  private static final int TOP = 10;
+  public static void main(String[] args) throws IOException, InterruptedException {
     // Написать код, который, как можно более параллельно:
     // - по заданному пути найдет все "*.java" файлы
     // - для каждого файла вычислит 10 самых популярных слов (см. #naiveCount())
@@ -37,9 +49,93 @@ public class Launcher {
     // Порядок результатов в консоли не обязательный.
     // При желании naiveSearch и naiveCount можно оптимизировать.
 
-    // test our naive methods:
-    testCount();
-    testSearch();
+    int numOfThreads = Runtime.getRuntime().availableProcessors();
+    // Два отдельных пула для чтения с диска и для запросов в сеть
+    ExecutorService executorFileIO = Executors.newFixedThreadPool(numOfThreads/2);
+    ExecutorService executorNetworkIO = Executors.newFixedThreadPool(numOfThreads/2);
+
+    Path path = Paths.get("").toAbsolutePath();
+
+    // Декорирование метода поиска кэшированием
+    var search = new CachedFunction<>(MockSearchEngine::mockSearch);
+    launch(path, search, executorFileIO, executorNetworkIO);
+
+    executorFileIO.shutdown();
+    executorNetworkIO.shutdown();
+  }
+
+  private static void launch(Path path,
+                             Function<String, Long> search,
+                             ExecutorService executorFileIO,
+                             ExecutorService executorNetworkIO) throws IOException {
+    try (Stream<Path> paths = Files.walk(path)) {
+      paths.filter(Files::isDirectory)
+              .map(p -> process(p, search, executorFileIO, executorNetworkIO))
+              .toList()
+              .forEach(CompletableFuture::join);
+    }
+  }
+
+  private static CompletableFuture<Void> process(Path path,
+                                                 Function<String, Long> search,
+                                                 ExecutorService executorFileIO,
+                                                 ExecutorService executorNetworkIO) {
+      return CompletableFuture
+              .supplyAsync(() -> processDirectory(path), executorFileIO)
+              .thenApplyAsync(dir -> processQueries(dir, search),  executorNetworkIO)
+              .thenAccept(Launcher::printResult);
+  }
+
+  private static void printResult(String result) {
+    if (result.isEmpty())
+      return;
+    System.out.println(result);
+  }
+
+  private static DirectoryInfo processDirectory(Path path) {
+    try {
+      return new DirectoryInfo(path, calcStat(path));
+    }
+    catch (IOException e) {
+      throw new RuntimeException(e);
+    }
+  }
+
+  private static List<String> calcStat(Path path) throws IOException {
+    return Files.walk(path, ONLY_DIR_WITHOUT_SUB)
+            .filter(Launcher::isJavaFile)
+            .map(Launcher::naiveCount)
+            .flatMap(map -> map.entrySet().stream())
+            .filter(Objects::nonNull)
+            .collect(Collectors.toMap(
+                    Map.Entry::getKey,
+                    Map.Entry::getValue,
+                    Long::sum
+            ))
+            .entrySet()
+            .stream()
+            .sorted(comparingByValue(reverseOrder()))
+            .limit(TOP)
+            .map(Map.Entry::getKey)
+            .collect(Collectors.toList());
+  }
+
+  private static boolean isJavaFile(Path path) {
+    return Files.isRegularFile(path) && path.getFileName().toString().endsWith("java");
+  }
+
+  private static String processQueries(DirectoryInfo info, Function<String, Long> search) {
+    if (info.isEmpty()) return "";
+    var path = info.path();
+    var queries = info.fileNames();
+    return queries.stream()
+            .map(q -> Map.entry(q, search.apply(q)))
+            .map(res -> formatOutput(path, res))
+            .collect(Collectors.joining("\n"));
+  }
+
+  private static String formatOutput(Path path, Map.Entry<String, Long> result) {
+    return String.join(" - ", path.toString(), result.getKey(), result.getValue().toString());
   }
 
   private static void testCount() {
@@ -56,28 +152,11 @@ public class Launcher {
         .entrySet()
         .stream()
         .sorted(comparingByValue(reverseOrder()))
-        .limit(10)
+        .limit(TOP)
         .collect(toMap(Map.Entry::getKey, Map.Entry::getValue));
     }
     catch (IOException e) {
       throw new RuntimeException(e);
     }
   }
-
-  private static void testSearch() throws IOException {
-    System.out.println(naiveSearch("public"));
-  }
-
-  private static long naiveSearch(String query) throws IOException {
-    Document document = Jsoup //
-      .connect("https://www.google.com/search?q=" + query) //
-      .userAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/80.0.3987.116 Safari/537.36") //
-      .get();
-
-    Element divResultStats = document.select("div#slim_appbar").first();
-    String text = divResultStats.text();
-    String resultsPart = text.substring(0, text.indexOf('('));
-    return Long.parseLong(resultsPart.replaceAll("[^0-9]", ""));
-  }
-
 }
