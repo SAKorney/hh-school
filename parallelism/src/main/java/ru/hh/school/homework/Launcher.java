@@ -69,47 +69,42 @@ public class Launcher {
                              ExecutorService executorFileIO,
                              ExecutorService executorNetworkIO) throws IOException {
     try (Stream<Path> paths = Files.walk(path)) {
-      paths
-              .parallel()
-              .filter(Files::isDirectory)
-              .forEach(p -> process(p, search, executorFileIO, executorNetworkIO));
+      paths.filter(Files::isDirectory)
+              .map(p -> process(p, search, executorFileIO, executorNetworkIO))
+              .toList()
+              .forEach(CompletableFuture::join);
     }
   }
 
-  private static void process(Path path,
-                              Function<String, Long> search,
-                              ExecutorService executorFileIO,
-                              ExecutorService executorNetworkIO) {
-    try {
-      CompletableFuture
-              .supplyAsync(() -> processDirectory(path, executorFileIO))
-              .thenAccept(dir -> processQueries(dir, search, executorNetworkIO))
-              .get();
-    } catch ( InterruptedException | ExecutionException e) {
-      throw new RuntimeException(e);
-    }
+  private static CompletableFuture<Void> process(Path path,
+                                                 Function<String, Long> search,
+                                                 ExecutorService executorFileIO,
+                                                 ExecutorService executorNetworkIO) {
+      return CompletableFuture
+              .supplyAsync(() -> processDirectory(path), executorFileIO)
+              .thenApplyAsync(dir -> processQueries(dir, search),  executorNetworkIO)
+              .thenAccept(Launcher::printResult);
   }
 
-  private static DirectoryInfo processDirectory(Path path, ExecutorService executor) {
+  private static void printResult(String result) {
+    if (result.isEmpty())
+      return;
+    System.out.println(result);
+  }
+
+  private static DirectoryInfo processDirectory(Path path) {
     try {
-      return new DirectoryInfo(path, calcStat(path, executor));
+      return new DirectoryInfo(path, calcStat(path));
     }
     catch (IOException e) {
       throw new RuntimeException(e);
     }
   }
 
-  private static List<String> calcStat(Path path,  ExecutorService executor) throws IOException {
+  private static List<String> calcStat(Path path) throws IOException {
     return Files.walk(path, ONLY_DIR_WITHOUT_SUB)
             .filter(Launcher::isJavaFile)
-//            .map(Launcher::naiveCount)
-//            Было сомнение, следует ли делать чтение с диска асинхронным.
-//            Всё-таки это едичный ресурс, который слабо умеет параллелится.
-            .map((file) -> CompletableFuture.supplyAsync(() -> naiveCount(file), executor))
-            // Переход к Eager evaluation, чтобы сформировать список задач и запустить их разом
-            .toList()
-            .stream()
-            .map(CompletableFuture::join)
+            .map(Launcher::naiveCount)
             .flatMap(map -> map.entrySet().stream())
             .filter(Objects::nonNull)
             .collect(Collectors.toMap(
@@ -129,23 +124,14 @@ public class Launcher {
     return Files.isRegularFile(path) && path.getFileName().toString().endsWith("java");
   }
 
-  private static void processQueries(DirectoryInfo info, Function<String, Long> search, ExecutorService executor) {
-    if (info.isEmpty()) return;
+  private static String processQueries(DirectoryInfo info, Function<String, Long> search) {
+    if (info.isEmpty()) return "";
     var path = info.path();
     var queries = info.fileNames();
-    var output = queries.stream()
-            .map(q -> CompletableFuture.supplyAsync(() -> Map.entry(q, search.apply(q)), executor))
-            // Переход к Eager evaluation, чтобы сформировать список задач и запустить их разом
-            .toList()
-            .stream()
-            .map(CompletableFuture::join)
+    return queries.stream()
+            .map(q -> Map.entry(q, search.apply(q)))
             .map(res -> formatOutput(path, res))
             .collect(Collectors.joining("\n"));
-    // Вывод ускорится, если сразу выводить на консоль.
-    // Однако, вывод будет без группировки по директориям
-    // т.к. будет осуществляться для тех слов, которые были
-    // обработаны раньше других.
-    System.out.println(output);
   }
 
   private static String formatOutput(Path path, Map.Entry<String, Long> result) {
